@@ -68,6 +68,9 @@ unsafe impl Sync for RemoteResource {}
 
 impl RemoteResource {
     fn new(stream: TcpStream, keepalive: Option<TcpKeepalive>) -> Self {
+        if let Err(error) = stream.set_nodelay(true) {
+            log::warn!("Could not enable TCP_NODELAY: {}", error);
+        }
         Self { stream, decoder: RefCell::new(Decoder::default()), keepalive }
     }
 }

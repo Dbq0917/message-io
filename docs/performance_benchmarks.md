@@ -82,3 +82,41 @@ It means, for example, that sending and receiving a message of 1 Byte or 64KB by
 *Note that *TCP* based protocols could split internally your message into several chunks of data.*
 
 If you want to test it yourself, execute `cargo bench`.
+
+### Idle C10K and 80/20 workload
+
+For a cluster with many idle clients, use the `c10k_idle` example. It opens 10,000
+`FramedTcp` connections, leaves 80% of them idle, and sends echo requests from the
+remaining 20%. The output includes OS thread count, open descriptors, process CPU
+usage, achieved RPS, and RTT percentiles.
+
+Run an all-in-one check:
+
+```sh
+cargo run --release --example c10k_idle -- \
+  local --connections 10000 --active-percent 20 --rps 2000 \
+  --idle-secs 5 --duration 10
+```
+
+For server-side CPU numbers, run the server and load generator in different terminals:
+
+```sh
+cargo run --release --example c10k_idle -- \
+  server --port 7100 --connections 10000 --duration 30
+
+cargo run --release --example c10k_idle -- \
+  load --addr 127.0.0.1:7100 --connections 10000 \
+  --active-percent 20 --rps 2000 --idle-secs 5 --duration 10
+```
+
+The server uses one `mio` poller for all sockets. Idle connections therefore create
+file descriptors and small connection records, but not one read thread per connection
+and no periodic work. Keep application callbacks short; forward CPU-heavy work to a
+small worker pool so business logic cannot delay the poller.
+
+A blocking thread-per-connection server is also available as a resource comparison:
+
+```sh
+cargo run --release --example c10k_idle -- \
+  blocking-server --port 7101 --connections 10000 --duration 30
+```
