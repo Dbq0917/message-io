@@ -82,6 +82,7 @@ pub trait ActionController: Send + Sync {
     fn send(&self, endpoint: Endpoint, data: &[u8]) -> SendStatus;
     fn remove(&self, id: ResourceId) -> bool;
     fn is_ready(&self, id: ResourceId) -> Option<bool>;
+    fn pending_send_bytes(&self, id: ResourceId) -> Option<usize>;
 }
 
 pub trait EventProcessor: Send + Sync {
@@ -198,6 +199,15 @@ impl<R: Remote, L: Local> ActionController for Driver<R, L> {
         match id.resource_type() {
             ResourceType::Remote => self.remote_registry.get(id).map(|r| r.properties.is_ready()),
             ResourceType::Local => self.local_registry.get(id).map(|_| true),
+        }
+    }
+
+    fn pending_send_bytes(&self, id: ResourceId) -> Option<usize> {
+        match id.resource_type() {
+            ResourceType::Remote => {
+                self.remote_registry.get(id).map(|r| r.resource.pending_send_bytes())
+            }
+            ResourceType::Local => self.local_registry.get(id).map(|_| 0),
         }
     }
 }

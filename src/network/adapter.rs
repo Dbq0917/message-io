@@ -65,6 +65,16 @@ pub enum SendStatus {
     /// It means that the correspond adapter has sent the message to the OS without errors.
     Sent,
 
+    /// The message has been accepted into the per-connection userspace send queue,
+    /// but part or all of it has not yet been written to the OS.
+    /// The network processor will flush the queue when the endpoint is writable.
+    Queued,
+
+    /// The connection's bounded send queue is full.
+    /// No bytes from this call were accepted: the caller should retain the message,
+    /// slow down, and retry it later. The connection is still alive.
+    Backpressure,
+
     /// This status is received in packet-based protocols where there is a limit in the bytes
     /// that a packet can have.
     MaxPacketSizeExceeded,
@@ -170,6 +180,12 @@ pub trait Remote: Resource + Sized {
     /// be disconnected and removed.
     fn ready_to_write(&self) -> bool {
         true
+    }
+
+    /// Number of bytes currently retained in the adapter's userspace send queue.
+    /// This value does not include bytes already accepted by the OS.
+    fn pending_send_bytes(&self) -> usize {
+        0
     }
 }
 

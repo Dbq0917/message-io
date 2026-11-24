@@ -91,6 +91,10 @@ impl ActionController for UnimplementedDriver {
     fn is_ready(&self, _: ResourceId) -> Option<bool> {
         panic!("{}", UNIMPLEMENTED_DRIVER_ERR);
     }
+
+    fn pending_send_bytes(&self, _: ResourceId) -> Option<usize> {
+        panic!("{}", UNIMPLEMENTED_DRIVER_ERR);
+    }
 }
 
 impl EventProcessor for UnimplementedDriver {

@@ -1,6 +1,6 @@
 use super::common::{SenderMsg, ReceiverMsg};
 
-use message_io::network::{NetEvent, Transport};
+use message_io::network::{NetEvent, SendStatus, Transport};
 use message_io::node::{self, NodeEvent};
 
 use std::fs::{self, File};
@@ -12,7 +12,8 @@ enum Signal {
     // Other signals here
 }
 
-const CHUNK_SIZE: usize = 65536;
+const CHUNK_SIZE: usize = 512 * 1024;
+const BACKPRESSURE_RETRY: Duration = Duration::from_millis(10);
 
 pub fn run(file_path: String) {
     let (handler, listener) = node::split();
@@ -25,6 +26,7 @@ pub fn run(file_path: String) {
     let file_name: String = file_path.rsplit('/').into_iter().next().unwrap_or(&file_path).into();
 
     let mut file_bytes_sent = 0;
+    let mut pending_chunk: Option<Vec<u8>> = None;
     listener.for_each(move |event| match event {
         NodeEvent::Network(net_event) => match net_event {
             NetEvent::Connected(_, established) => {
@@ -58,22 +60,54 @@ pub fn run(file_path: String) {
         },
         NodeEvent::Signal(signal) => match signal {
             Signal::SendChunk => {
-                let mut data = [0; CHUNK_SIZE];
-                let bytes_read = file.read(&mut data).unwrap();
-                if bytes_read > 0 {
-                    let chunk = SenderMsg::Chunk(Vec::from(&data[0..bytes_read]));
-                    let output_data = bincode::serialize(&chunk).unwrap();
-                    handler.network().send(server_id, &output_data);
-                    file_bytes_sent += bytes_read;
+                let output_data = match pending_chunk.take() {
+                    Some(output_data) => output_data,
+                    None => {
+                        let mut data = vec![0; CHUNK_SIZE];
+                        let bytes_read = file.read(&mut data).unwrap();
+                        if bytes_read == 0 {
+                            let pending = handler
+                                .network()
+                                .pending_send_bytes(server_id.resource_id())
+                                .unwrap_or(0);
+                            if pending > 0 {
+                                handler
+                                    .signals()
+                                    .send_with_timer(Signal::SendChunk, Duration::from_millis(1));
+                            }
+                            else {
+                                println!("\nFile sent!");
+                                handler.stop();
+                            }
+                            return;
+                        }
 
-                    let percentage = ((file_bytes_sent as f32 / file_size as f32) * 100.0) as usize;
-                    print!("\rSending '{}': {}%", file_name, percentage);
+                        let chunk = SenderMsg::Chunk(Vec::from(&data[0..bytes_read]));
+                        let output_data = bincode::serialize(&chunk).unwrap();
+                        file_bytes_sent += bytes_read;
 
-                    handler.signals().send_with_timer(Signal::SendChunk, Duration::from_micros(10));
-                }
-                else {
-                    println!("\nFile sent!");
-                    handler.stop();
+                        let percentage =
+                            ((file_bytes_sent as f32 / file_size as f32) * 100.0) as usize;
+                        print!("\rSending '{}': {}%", file_name, percentage);
+                        output_data
+                    }
+                };
+
+                match handler.network().send(server_id, &output_data) {
+                    SendStatus::Sent | SendStatus::Queued => {
+                        handler
+                            .signals()
+                            .send_with_timer(Signal::SendChunk, Duration::from_micros(10));
+                    }
+                    SendStatus::Backpressure | SendStatus::ResourceNotAvailable => {
+                        // Keep the chunk and retry it; do not read more of the file.
+                        pending_chunk = Some(output_data);
+                        handler.signals().send_with_timer(Signal::SendChunk, BACKPRESSURE_RETRY);
+                    }
+                    status => {
+                        eprintln!("\nUnexpected send status: {status:?}");
+                        handler.stop();
+                    }
                 }
             }
         },

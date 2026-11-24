@@ -6,6 +6,7 @@ use crate::network::adapter::{
 };
 use crate::network::{RemoteAddr, Readiness, TransportConnect, TransportListen};
 use crate::util::encoding::{self, Decoder, MAX_ENCODED_SIZE};
+use crate::adapters::write_queue::{self, WriteQueue, DEFAULT_PENDING_SEND_LIMIT};
 
 use mio::net::{TcpListener, TcpStream};
 use mio::event::{Source};
@@ -13,8 +14,9 @@ use mio::event::{Source};
 use socket2::{Socket};
 
 use std::net::{SocketAddr};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read};
 use std::cell::{RefCell};
+use std::sync::Mutex;
 use std::mem::{forget, MaybeUninit};
 #[cfg(target_os = "windows")]
 use std::os::windows::io::{FromRawSocket, AsRawSocket};
@@ -23,9 +25,16 @@ use std::os::{fd::AsRawFd, unix::io::FromRawFd};
 
 const INPUT_BUFFER_SIZE: usize = u16::MAX as usize; // 2^16 - 1
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FramedTcpConnectConfig {
     keepalive: Option<TcpKeepalive>,
+    pending_send_limit: usize,
+}
+
+impl Default for FramedTcpConnectConfig {
+    fn default() -> Self {
+        Self { keepalive: None, pending_send_limit: DEFAULT_PENDING_SEND_LIMIT }
+    }
 }
 
 impl FramedTcpConnectConfig {
@@ -34,17 +43,39 @@ impl FramedTcpConnectConfig {
         self.keepalive = Some(keepalive);
         self
     }
+
+    /// Sets the byte high-water mark for encoded frame data retained in userspace
+    /// while the peer is slow. The queue can overshoot by one send payload;
+    /// returns [`SendStatus::Backpressure`] once the mark is reached.
+    pub fn with_pending_send_limit(mut self, bytes: usize) -> Self {
+        self.pending_send_limit = bytes.max(1);
+        self
+    }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FramedTcpListenConfig {
     keepalive: Option<TcpKeepalive>,
+    pending_send_limit: usize,
+}
+
+impl Default for FramedTcpListenConfig {
+    fn default() -> Self {
+        Self { keepalive: None, pending_send_limit: DEFAULT_PENDING_SEND_LIMIT }
+    }
 }
 
 impl FramedTcpListenConfig {
     /// Enables TCP keepalive settings on client connection sockets.
     pub fn with_keepalive(mut self, keepalive: TcpKeepalive) -> Self {
         self.keepalive = Some(keepalive);
+        self
+    }
+
+    /// Sets the pending send limit used by sockets accepted from this listener.
+    /// See [`FramedTcpConnectConfig::with_pending_send_limit`].
+    pub fn with_pending_send_limit(mut self, bytes: usize) -> Self {
+        self.pending_send_limit = bytes.max(1);
         self
     }
 }
@@ -59,6 +90,7 @@ pub(crate) struct RemoteResource {
     stream: TcpStream,
     decoder: RefCell<Decoder>,
     keepalive: Option<TcpKeepalive>,
+    pending_writes: Mutex<WriteQueue>,
 }
 
 // SAFETY:
@@ -67,8 +99,13 @@ pub(crate) struct RemoteResource {
 unsafe impl Sync for RemoteResource {}
 
 impl RemoteResource {
-    fn new(stream: TcpStream, keepalive: Option<TcpKeepalive>) -> Self {
-        Self { stream, decoder: RefCell::new(Decoder::default()), keepalive }
+    fn new(stream: TcpStream, keepalive: Option<TcpKeepalive>, pending_send_limit: usize) -> Self {
+        Self {
+            stream,
+            decoder: RefCell::new(Decoder::default()),
+            keepalive,
+            pending_writes: Mutex::new(WriteQueue::new(pending_send_limit)),
+        }
     }
 }
 
@@ -91,7 +128,7 @@ impl Remote for RemoteResource {
         let stream = TcpStream::connect(peer_addr)?;
         let local_addr = stream.local_addr()?;
         Ok(ConnectionInfo {
-            remote: RemoteResource::new(stream, config.keepalive),
+            remote: RemoteResource::new(stream, config.keepalive, config.pending_send_limit),
             local_addr,
             peer_addr,
         })
@@ -131,29 +168,70 @@ impl Remote for RemoteResource {
         let mut buf = [0; MAX_ENCODED_SIZE]; // used to avoid a heap allocation
         let encoded_size = encoding::encode_size(data, &mut buf);
 
-        let mut total_bytes_sent = 0;
-        let total_bytes = encoded_size.len() + data.len();
-        loop {
-            let data_to_send = match total_bytes_sent < encoded_size.len() {
-                true => &encoded_size[total_bytes_sent..],
-                false => &data[total_bytes_sent - encoded_size.len()..],
-            };
+        let mut pending_writes =
+            self.pending_writes.lock().expect(crate::util::thread::OTHER_THREAD_ERR);
 
-            let mut stream = &self.stream;
-            match stream.write(data_to_send) {
-                Ok(bytes_sent) => {
-                    total_bytes_sent += bytes_sent;
-                    if total_bytes_sent == total_bytes {
-                        break SendStatus::Sent;
-                    }
-                }
-                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(err) => {
-                    log::error!("TCP receive error: {}", err);
-                    break SendStatus::ResourceNotFound; // should not happen
-                }
+        if let Err(err) = pending_writes.flush(&mut &self.stream) {
+            log::error!("Framed TCP send flush error: {}", err);
+            return SendStatus::ResourceNotFound;
+        }
+
+        if pending_writes.is_full() {
+            return SendStatus::Backpressure;
+        }
+
+        if pending_writes.pending_bytes() > 0 {
+            // A previous frame is still queued. Keep this complete frame behind it.
+            pending_writes.enqueue(encoded_size.to_vec());
+            pending_writes.enqueue(data.to_vec());
+            return SendStatus::Queued;
+        }
+
+        let header_remaining = match write_queue::write_prefix(&mut &self.stream, encoded_size) {
+            Ok(remaining) => remaining,
+            Err(err) => {
+                log::error!("Framed TCP header send error: {}", err);
+                return SendStatus::ResourceNotFound;
+            }
+        };
+
+        if let Some(header) = header_remaining {
+            pending_writes.enqueue(header.to_vec());
+            pending_writes.enqueue(data.to_vec());
+            return SendStatus::Queued;
+        }
+
+        match write_queue::write_prefix(&mut &self.stream, data) {
+            Ok(None) => SendStatus::Sent,
+            Ok(Some(pending_data)) => {
+                pending_writes.enqueue(pending_data.to_vec());
+                SendStatus::Queued
+            }
+            Err(err) => {
+                log::error!("Framed TCP send error: {}", err);
+                SendStatus::ResourceNotFound
             }
         }
+    }
+
+    fn ready_to_write(&self) -> bool {
+        let flush_result = self
+            .pending_writes
+            .lock()
+            .expect(crate::util::thread::OTHER_THREAD_ERR)
+            .flush(&mut &self.stream);
+
+        match flush_result {
+            Ok(_) => true,
+            Err(err) => {
+                log::error!("Framed TCP pending write flush error: {}", err);
+                false
+            }
+        }
+    }
+
+    fn pending_send_bytes(&self) -> usize {
+        self.pending_writes.lock().expect(crate::util::thread::OTHER_THREAD_ERR).pending_bytes()
     }
 
     fn pending(&self, _readiness: Readiness) -> PendingStatus {
@@ -182,6 +260,7 @@ impl Remote for RemoteResource {
 pub(crate) struct LocalResource {
     listener: TcpListener,
     keepalive: Option<TcpKeepalive>,
+    pending_send_limit: usize,
 }
 
 impl Resource for LocalResource {
@@ -201,7 +280,13 @@ impl Local for LocalResource {
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr().unwrap();
         Ok(ListeningInfo {
-            local: { LocalResource { listener, keepalive: config.keepalive } },
+            local: {
+                LocalResource {
+                    listener,
+                    keepalive: config.keepalive,
+                    pending_send_limit: config.pending_send_limit,
+                }
+            },
             local_addr,
         })
     }
@@ -211,7 +296,7 @@ impl Local for LocalResource {
             match self.listener.accept() {
                 Ok((stream, addr)) => accept_remote(AcceptedType::Remote(
                     addr,
-                    RemoteResource::new(stream, self.keepalive.clone()),
+                    RemoteResource::new(stream, self.keepalive.clone(), self.pending_send_limit),
                 )),
                 Err(ref err) if err.kind() == ErrorKind::WouldBlock => break,
                 Err(ref err) if err.kind() == ErrorKind::Interrupted => continue,

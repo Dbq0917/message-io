@@ -9,7 +9,7 @@ use rand::{SeedableRng, Rng};
 
 use std::collections::{HashSet};
 use std::net::{SocketAddr};
-use std::time::{Duration};
+use std::time::{Duration, Instant};
 
 const LOCAL_ADDR: &'static str = "127.0.0.1:0";
 const MIN_MESSAGE: &'static [u8] = &[42];
@@ -357,7 +357,18 @@ fn message_size(transport: Transport, message_size: usize) {
                 // and its buffer is fill.
                 _async_sender = Some(NamespacedThread::spawn("test-sender", move || {
                     let status = node.network().send(receiver, &sent_message);
-                    assert_eq!(status, SendStatus::Sent);
+                    assert!(matches!(status, SendStatus::Sent | SendStatus::Queued));
+
+                    // A queued write is flushed by the network thread. Wait for the
+                    // userspace queue to drain before removing the endpoint; the OS
+                    // still retains its normal send buffer.
+                    for _ in 0..1000 {
+                        if node.network().pending_send_bytes(receiver.resource_id()) == Some(0) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert_eq!(node.network().pending_send_bytes(receiver.resource_id()), Some(0));
                     assert!(node.network().remove(receiver.resource_id()));
                 }));
             }
@@ -379,6 +390,113 @@ fn message_size(transport: Transport, message_size: usize) {
             }
         },
     });
+}
+
+#[cfg_attr(feature = "tcp", test_case(Transport::Tcp))]
+#[cfg_attr(feature = "tcp", test_case(Transport::FramedTcp))]
+fn slow_consumer_applies_backpressure(transport: Transport) {
+    let peer_listener = std::net::TcpListener::bind(LOCAL_ADDR).unwrap();
+    let peer_addr = peer_listener.local_addr().unwrap();
+    let (start_reading_tx, start_reading_rx) = crossbeam_channel::bounded(1);
+
+    let peer_thread = std::thread::spawn(move || {
+        let (mut socket, _) = peer_listener.accept().unwrap();
+        start_reading_rx.recv_timeout(*TIMEOUT).unwrap();
+
+        let mut received = 0usize;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            match std::io::Read::read(&mut socket, &mut buffer) {
+                Ok(0) => break,
+                Ok(bytes) => received += bytes,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        received
+    });
+
+    let (handler, listener) = node::split::<()>();
+    let node_thread = std::thread::spawn(move || listener.for_each(|_| {}));
+
+    let (endpoint, _) = handler.network().connect(transport, peer_addr).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while handler.network().is_ready(endpoint.resource_id()) != Some(true) {
+        assert!(Instant::now() < deadline, "connection did not become ready");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let chunk = vec![7u8; 512 * 1024]; // File blocks are hundreds of KiB.
+    let mut accepted_before_backpressure = 0;
+    let mut saw_backpressure = false;
+
+    for _ in 0..1000 {
+        match handler.network().send(endpoint, &chunk) {
+            SendStatus::Sent | SendStatus::Queued => accepted_before_backpressure += 1,
+            SendStatus::Backpressure => {
+                saw_backpressure = true;
+                break;
+            }
+            status => panic!("unexpected send status while peer is slow: {:?}", status),
+        }
+    }
+
+    assert!(saw_backpressure, "a full send queue must report backpressure");
+    assert!(
+        accepted_before_backpressure < 64,
+        "too many chunks accepted before backpressure: {}",
+        accepted_before_backpressure
+    );
+
+    let pending = handler.network().pending_send_bytes(endpoint.resource_id()).unwrap();
+    assert!(pending < 4 * 1024 * 1024, "unexpectedly large pending queue: {}", pending);
+
+    // Ignoring the signal and continuing to call send must not grow the queue.
+    for _ in 0..1000 {
+        assert_eq!(handler.network().send(endpoint, &chunk), SendStatus::Backpressure);
+    }
+    assert_eq!(
+        handler.network().pending_send_bytes(endpoint.resource_id()),
+        Some(pending),
+        "rejected sends must not append more data"
+    );
+
+    // The signal tells the producer to slow down, not to disconnect. Once the peer
+    // reads again, the bounded queue drains and the same rejected chunk can be retried.
+    start_reading_tx.send(()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while handler.network().pending_send_bytes(endpoint.resource_id()) != Some(0) {
+        assert!(Instant::now() < deadline, "pending writes did not drain");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match handler.network().send(endpoint, &chunk) {
+            SendStatus::Sent => break,
+            SendStatus::Queued => {
+                let drain_deadline = Instant::now() + Duration::from_secs(10);
+                while handler.network().pending_send_bytes(endpoint.resource_id()) != Some(0) {
+                    assert!(Instant::now() < drain_deadline, "retried chunk did not drain");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                break;
+            }
+            SendStatus::Backpressure => {
+                assert!(Instant::now() < deadline, "connection did not recover");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            status => panic!("unexpected send status during recovery: {:?}", status),
+        }
+    }
+
+    handler.stop();
+    node_thread.join().unwrap();
+    drop(handler);
+
+    let received = peer_thread.join().unwrap();
+    assert!(received > 0, "peer should receive queued and retried data");
 }
 
 #[cfg(target_os = "macos")]

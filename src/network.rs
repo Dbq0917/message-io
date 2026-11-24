@@ -302,6 +302,11 @@ impl NetworkController {
     /// Except cases where you need to be sure that the message has been sent,
     /// you will want to process a [`NetEvent::Disconnected`] to determine if the connection +
     /// is *alive* instead of check if `send()` returned [`SendStatus::ResourceNotFound`].
+    ///
+    /// Slow peers can produce [`SendStatus::Queued`] while the bounded per-connection send
+    /// buffer retains the message, or [`SendStatus::Backpressure`] when that buffer is full.
+    /// A backpressure result rejects the current send without disconnecting; the caller should
+    /// retain the unchanged message and retry it after the endpoint drains.
     pub fn send(&self, endpoint: Endpoint, data: &[u8]) -> SendStatus {
         log::trace!("Sending {} bytes to {}...", data.len(), endpoint);
         let status =
@@ -337,6 +342,19 @@ impl NetworkController {
     /// a `None` is returned.
     pub fn is_ready(&self, resource_id: ResourceId) -> Option<bool> {
         self.controllers[resource_id.adapter_id() as usize].is_ready(resource_id)
+    }
+
+    /// Returns the number of bytes currently buffered in userspace because the
+    /// endpoint's peer is not reading fast enough.
+    ///
+    /// `None` is returned if the resource does not exist. A value of `0` means that
+    /// the library has handed all buffered data to the OS; it does not guarantee that
+    /// the peer application has read it yet.
+    ///
+    /// This value is useful for observability and tests. [`SendStatus::Backpressure`]
+    /// is the primary signal for producers to slow down.
+    pub fn pending_send_bytes(&self, resource_id: ResourceId) -> Option<usize> {
+        self.controllers[resource_id.adapter_id() as usize].pending_send_bytes(resource_id)
     }
 }
 

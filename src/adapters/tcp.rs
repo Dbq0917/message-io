@@ -5,6 +5,7 @@ use crate::network::adapter::{
     ListeningInfo, PendingStatus,
 };
 use crate::network::{RemoteAddr, Readiness, TransportConnect, TransportListen};
+use crate::adapters::write_queue::{self, WriteQueue, DEFAULT_PENDING_SEND_LIMIT};
 
 use mio::net::{TcpListener, TcpStream};
 use mio::event::{Source};
@@ -14,7 +15,8 @@ use socket2::{Socket, Domain, Type, Protocol};
 use std::net::{SocketAddr};
 #[cfg(unix)]
 use std::ffi::{CString};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read};
+use std::sync::Mutex;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use std::num::NonZeroU32;
 use std::mem::{forget, MaybeUninit};
@@ -32,11 +34,23 @@ pub const INPUT_BUFFER_SIZE: usize = u16::MAX as usize; // 2^16 - 1
 /// The maximum length of the pending (unaccepted) connection queue of a listener.
 pub const LISTENER_BACKLOG: c_int = 1024;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TcpConnectConfig {
     bind_device: Option<String>,
     source_address: Option<SocketAddr>,
     keepalive: Option<TcpKeepalive>,
+    pending_send_limit: usize,
+}
+
+impl Default for TcpConnectConfig {
+    fn default() -> Self {
+        Self {
+            bind_device: None,
+            source_address: None,
+            keepalive: None,
+            pending_send_limit: DEFAULT_PENDING_SEND_LIMIT,
+        }
+    }
 }
 
 impl TcpConnectConfig {
@@ -58,12 +72,28 @@ impl TcpConnectConfig {
         self.source_address = Some(source_address);
         self
     }
+
+    /// Sets the byte high-water mark for userspace data retained by this
+    /// connection while the peer is slow. The queue can overshoot by one send
+    /// payload; once the mark is reached,
+    /// [`SendStatus::Backpressure`] is returned instead of growing the queue without bound.
+    pub fn with_pending_send_limit(mut self, bytes: usize) -> Self {
+        self.pending_send_limit = bytes.max(1);
+        self
+    }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TcpListenConfig {
     bind_device: Option<String>,
     keepalive: Option<TcpKeepalive>,
+    pending_send_limit: usize,
+}
+
+impl Default for TcpListenConfig {
+    fn default() -> Self {
+        Self { bind_device: None, keepalive: None, pending_send_limit: DEFAULT_PENDING_SEND_LIMIT }
+    }
 }
 
 impl TcpListenConfig {
@@ -79,6 +109,13 @@ impl TcpListenConfig {
         self.keepalive = Some(keepalive);
         self
     }
+
+    /// Sets the pending send limit used by sockets accepted from this listener.
+    /// See [`TcpConnectConfig::with_pending_send_limit`].
+    pub fn with_pending_send_limit(mut self, bytes: usize) -> Self {
+        self.pending_send_limit = bytes.max(1);
+        self
+    }
 }
 
 pub(crate) struct TcpAdapter;
@@ -90,6 +127,7 @@ impl Adapter for TcpAdapter {
 pub(crate) struct RemoteResource {
     stream: TcpStream,
     keepalive: Option<TcpKeepalive>,
+    pending_writes: Mutex<WriteQueue>,
 }
 
 impl Resource for RemoteResource {
@@ -153,7 +191,11 @@ impl Remote for RemoteResource {
         let stream = TcpStream::from_std(socket.into());
         let local_addr = stream.local_addr()?;
         Ok(ConnectionInfo {
-            remote: Self { stream, keepalive: config.keepalive },
+            remote: Self {
+                stream,
+                keepalive: config.keepalive,
+                pending_writes: Mutex::new(WriteQueue::new(config.pending_send_limit)),
+            },
             local_addr,
             peer_addr,
         })
@@ -184,30 +226,56 @@ impl Remote for RemoteResource {
     }
 
     fn send(&self, data: &[u8]) -> SendStatus {
-        // TODO: The current implementation implies an active waiting,
-        // improve it using POLLIN instead to avoid active waiting.
-        // Note: Despite the fear that an active waiting could generate,
-        // this only occurs in the case when the receiver is full because reads slower that it sends.
-        let mut total_bytes_sent = 0;
-        loop {
-            let mut stream = &self.stream;
-            match stream.write(&data[total_bytes_sent..]) {
-                Ok(bytes_sent) => {
-                    total_bytes_sent += bytes_sent;
-                    if total_bytes_sent == data.len() {
-                        break SendStatus::Sent;
-                    }
-                }
-                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+        let mut pending_writes =
+            self.pending_writes.lock().expect(crate::util::thread::OTHER_THREAD_ERR);
 
-                // Others errors are considered fatal for the connection.
-                // a Event::Disconnection will be generated later.
-                Err(err) => {
-                    log::error!("TCP receive error: {}", err);
-                    break SendStatus::ResourceNotFound; // should not happen
-                }
+        if let Err(err) = pending_writes.flush(&mut &self.stream) {
+            log::error!("TCP send flush error: {}", err);
+            return SendStatus::ResourceNotFound;
+        }
+
+        if pending_writes.is_full() {
+            return SendStatus::Backpressure;
+        }
+
+        if pending_writes.pending_bytes() > 0 {
+            // The OS socket is still blocked and the queue has data.
+            // Preserve FIFO ordering by appending this whole message.
+            pending_writes.enqueue(data.to_vec());
+            return SendStatus::Queued;
+        }
+
+        match write_queue::write_prefix(&mut &self.stream, data) {
+            Ok(None) => SendStatus::Sent,
+            Ok(Some(pending_data)) => {
+                pending_writes.enqueue(pending_data.to_vec());
+                SendStatus::Queued
+            }
+            Err(err) => {
+                log::error!("TCP send error: {}", err);
+                SendStatus::ResourceNotFound
             }
         }
+    }
+
+    fn ready_to_write(&self) -> bool {
+        let flush_result = self
+            .pending_writes
+            .lock()
+            .expect(crate::util::thread::OTHER_THREAD_ERR)
+            .flush(&mut &self.stream);
+
+        match flush_result {
+            Ok(_) => true,
+            Err(err) => {
+                log::error!("TCP pending write flush error: {}", err);
+                false
+            }
+        }
+    }
+
+    fn pending_send_bytes(&self) -> usize {
+        self.pending_writes.lock().expect(crate::util::thread::OTHER_THREAD_ERR).pending_bytes()
     }
 
     fn pending(&self, _readiness: Readiness) -> PendingStatus {
@@ -251,6 +319,7 @@ pub fn check_stream_ready(stream: &TcpStream) -> PendingStatus {
 pub(crate) struct LocalResource {
     listener: TcpListener,
     keepalive: Option<TcpKeepalive>,
+    pending_send_limit: usize,
 }
 
 impl Resource for LocalResource {
@@ -305,7 +374,13 @@ impl Local for LocalResource {
 
         let local_addr = listener.local_addr().unwrap();
         Ok(ListeningInfo {
-            local: { LocalResource { listener, keepalive: config.keepalive } },
+            local: {
+                LocalResource {
+                    listener,
+                    keepalive: config.keepalive,
+                    pending_send_limit: config.pending_send_limit,
+                }
+            },
             local_addr,
         })
     }
@@ -315,7 +390,11 @@ impl Local for LocalResource {
             match self.listener.accept() {
                 Ok((stream, addr)) => accept_remote(AcceptedType::Remote(
                     addr,
-                    RemoteResource { stream, keepalive: self.keepalive.clone() },
+                    RemoteResource {
+                        stream,
+                        keepalive: self.keepalive.clone(),
+                        pending_writes: Mutex::new(WriteQueue::new(self.pending_send_limit)),
+                    },
                 )),
                 Err(ref err) if err.kind() == ErrorKind::WouldBlock => break,
                 Err(ref err) if err.kind() == ErrorKind::Interrupted => continue,

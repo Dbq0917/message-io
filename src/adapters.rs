@@ -1,6 +1,9 @@
 mod template;
 
 #[cfg(feature = "tcp")]
+pub(crate) mod write_queue;
+
+#[cfg(feature = "tcp")]
 pub mod tcp;
 #[cfg(feature = "tcp")]
 pub mod framed_tcp;
